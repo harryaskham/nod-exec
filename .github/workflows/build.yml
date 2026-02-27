@@ -1,0 +1,108 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-latest
+          - system: aarch64-linux
+            runner: ubuntu-latest
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Set up QEMU for aarch64
+        if: matrix.system == 'aarch64-linux'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build server
+        run: |
+          if [ "${{ matrix.system }}" = "aarch64-linux" ]; then
+            nix build .#packages.aarch64-linux.server --system aarch64-linux -L
+          else
+            nix build .#packages.x86_64-linux.server -L
+          fi
+
+      - name: Build client
+        run: |
+          if [ "${{ matrix.system }}" = "aarch64-linux" ]; then
+            nix build .#packages.aarch64-linux.client --system aarch64-linux -L
+          else
+            nix build .#packages.x86_64-linux.client -L
+          fi
+
+      - name: Build nc client
+        run: |
+          if [ "${{ matrix.system }}" = "aarch64-linux" ]; then
+            nix build .#packages.aarch64-linux.nc --system aarch64-linux -L
+          else
+            nix build .#packages.x86_64-linux.nc -L
+          fi
+
+      - name: Package binaries
+        run: |
+          mkdir -p dist
+          # Copy binaries out of nix store, following symlinks
+          for pkg in server client nc; do
+            if [ "${{ matrix.system }}" = "aarch64-linux" ]; then
+              nix build .#packages.aarch64-linux.$pkg --system aarch64-linux -o result-$pkg
+            else
+              nix build .#packages.x86_64-linux.$pkg -o result-$pkg
+            fi
+          done
+          # Create a self-contained tarball with the scripts + their dependencies
+          # For shell scripts, we just need the bin/ contents
+          mkdir -p dist/bin
+          for pkg in server client nc; do
+            cp -rL result-$pkg/bin/* dist/bin/
+          done
+          # Also include the android client
+          if [ "${{ matrix.system }}" = "aarch64-linux" ]; then
+            nix build .#packages.aarch64-linux.android --system aarch64-linux -o result-android
+          else
+            nix build .#packages.x86_64-linux.android -o result-android
+          fi
+          cp -L result-android dist/nod-exec-android.sh
+          tar czf nod-exec-${{ matrix.system }}.tar.gz -C dist .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nod-exec-${{ matrix.system }}
+          path: nod-exec-${{ matrix.system }}.tar.gz
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            nod-exec-x86_64-linux/nod-exec-x86_64-linux.tar.gz
+            nod-exec-aarch64-linux/nod-exec-aarch64-linux.tar.gz
+          generate_release_notes: true
