@@ -10,11 +10,9 @@
 #   3. Server execs the command; all subsequent output is from the command
 #   4. Connection closes when command exits
 #
-# Outputs:
-#   server  - nod-exec-server (socat-based TCP listener)
-#   client  - nod-exec (bash /dev/tcp client with interactive support)
-#   nc      - nod-exec-nc (minimal netcat-based client)
-#   android - nod-exec-android.sh (portable shell script for Tasker/KWGT)
+# Ports:
+#   - Base port (default 18357): pipe mode for one-shot commands
+#   - Base port + 1 (default 18358): PTY mode for interactive shells
 {
   pkgs,
   port ? "18357",
@@ -26,15 +24,45 @@ let
   defaultPort = port;
   defaultHost = host;
 
+  # Shared environment setup sourced by both handlers
+  envSetup = ''
+    # Reset environment to match a fresh NOD login shell.
+    # supervisord passes a minimal PATH; we need the full user env.
+    export HOME="''${HOME:-/home/nix-on-droid}"
+    export USER="''${USER:-nix-on-droid}"
+    cd "$HOME" 2>/dev/null || true
+
+    # Clear supervisor's PATH and session-init guard so we get a fresh setup
+    unset PATH
+    unset __NOD_SESS_INIT_SOURCED
+    unset __ETC_PROFILE_SOURCED
+    unset __NIXOS_SET_ENVIRONMENT_DONE
+
+    # Source session init to rebuild PATH with all nix profile bins
+    if [ -f "$HOME/.nix-profile/etc/profile.d/nix-on-droid-session-init.sh" ]; then
+      . "$HOME/.nix-profile/etc/profile.d/nix-on-droid-session-init.sh"
+    elif [ -f /etc/profile ]; then
+      . /etc/profile
+    fi
+  '';
+
   nod-exec-handler = pkgs.writeScript "nod-exec-handler" ''
     #!${pkgs.bash}/bin/bash
-
     IFS= read -r CMD_LINE 2>/dev/null || exit 1
     [ -z "$CMD_LINE" ] && exit 1
-
+    ${envSetup}
     printf '%s\n' "__NOD_EXEC_READY__"
+    exec ${pkgs.bash}/bin/bash -c "$CMD_LINE"
+  '';
 
-    exec ${pkgs.bash}/bin/bash -l -c "$CMD_LINE"
+  nod-exec-handler-pty = pkgs.writeScript "nod-exec-handler-pty" ''
+    #!${pkgs.bash}/bin/bash
+    IFS= read -r CMD_LINE 2>/dev/null || exit 1
+    [ -z "$CMD_LINE" ] && exit 1
+    ${envSetup}
+    stty sane 2>/dev/null || true
+    printf '%s\n' "__NOD_EXEC_READY__"
+    exec ${pkgs.bash}/bin/bash -c "$CMD_LINE"
   '';
 
   nod-exec-server = pkgs.writeScriptBin "nod-exec-server" ''
@@ -42,19 +70,28 @@ let
     set -euo pipefail
 
     PORT="''${NOD_EXEC_PORT:-${defaultPort}}"
+    PTY_PORT=$((PORT + 1))
     HOST="''${NOD_EXEC_HOST:-${defaultHost}}"
     PIDFILE="''${NOD_EXEC_PIDFILE:-/tmp/run/nod-exec-server.pid}"
 
-    cleanup() { rm -f "$PIDFILE"; }
+    cleanup() {
+      kill "$PTY_PID" 2>/dev/null || true
+      rm -f "$PIDFILE"
+    }
     trap cleanup EXIT
-
-    echo "nod-exec-server: listening on $HOST:$PORT" >&2
-    echo "nod-exec-server: protocol - connect, send one line (command), then I/O" >&2
-    echo "nod-exec-server: pidfile $PIDFILE" >&2
 
     mkdir -p "$(dirname "$PIDFILE")"
     echo $$ > "$PIDFILE"
 
+    echo "nod-exec-server: pipe on $HOST:$PORT, pty on $HOST:$PTY_PORT" >&2
+
+    # PTY listener for interactive sessions (shells, TUIs)
+    ${pkgs.socat}/bin/socat \
+      TCP-LISTEN:"$PTY_PORT",bind="$HOST",reuseaddr,fork \
+      EXEC:"${nod-exec-handler-pty}",pty,setsid,ctty,stderr,echo=0 &
+    PTY_PID=$!
+
+    # Pipe listener for one-shot commands (Tasker, KWGT)
     exec ${pkgs.socat}/bin/socat \
       TCP-LISTEN:"$PORT",bind="$HOST",reuseaddr,fork \
       EXEC:"${nod-exec-handler}",stderr
@@ -130,8 +167,6 @@ let
 
   nod-exec-nc = pkgs.writeScriptBin "nod-exec-nc" ''
     #!${pkgs.bash}/bin/bash
-    # Minimal client using nc for maximum compatibility.
-    # Output only (no interactive PTY). Perfect for Tasker/KWGT.
     PORT="''${NOD_EXEC_PORT:-${defaultPort}}"
     HOST="''${NOD_EXEC_HOST:-${defaultHost}}"
 
@@ -147,15 +182,6 @@ let
 
   nod-exec-android = pkgs.writeText "nod-exec-android.sh" ''
     #!/system/bin/sh
-    # nod-exec-android: lightweight client for calling nod-exec-server
-    # from outside proot (e.g. Tasker Run Shell, KWGT $sh()$).
-    #
-    # Usage:
-    #   sh /storage/emulated/0/shared/nod-exec-android.sh "echo hello"
-    #
-    # For KWGT:
-    #   $sh("sh /storage/emulated/0/shared/nod-exec-android.sh 'uptime'")$
-
     PORT="''${NOD_EXEC_PORT:-${defaultPort}}"
     HOST="''${NOD_EXEC_HOST:-${defaultHost}}"
 
@@ -190,7 +216,7 @@ let
   '';
 
 in {
-  inherit nod-exec-server nod-exec-client nod-exec-nc nod-exec-handler nod-exec-android;
+  inherit nod-exec-server nod-exec-client nod-exec-nc nod-exec-handler nod-exec-handler-pty nod-exec-android;
   server = nod-exec-server;
   client = nod-exec-client;
   nc = nod-exec-nc;
